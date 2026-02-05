@@ -109,6 +109,61 @@ class MarketAnalyzer:
         self.config = get_config()
         self.search_service = search_service
         self.analyzer = analyzer
+        # 便于上层（WebUI/通知）将“市场数据快照”拼到复盘正文前面
+        self.last_overview: Optional[MarketOverview] = None
+        self.last_news: Optional[List] = None
+
+    def format_overview_markdown(self, overview: MarketOverview) -> str:
+        """
+        将 MarketOverview 格式化成可直接拼接到报告顶部的 Markdown（数据快照）。
+        """
+        parts: List[str] = []
+
+        parts.append("## 📌 市场数据快照")
+
+        # 主要指数
+        parts.append("")
+        parts.append("### 主要指数")
+        if overview.indices:
+            parts.append("| 指数 | 点位 | 涨跌幅 | 涨跌额 |")
+            parts.append("|---|---:|---:|---:|")
+            for idx in overview.indices:
+                parts.append(
+                    f"| {idx.name} | {idx.current:.2f} | {idx.change_pct:+.2f}% | {idx.change:+.2f} |"
+                )
+        else:
+            parts.append("暂无指数数据（接口异常）")
+
+        # 涨跌统计
+        parts.append("")
+        parts.append("### 涨跌统计")
+        parts.append("| 指标 | 数值 |")
+        parts.append("|---|---:|")
+        parts.append(f"| 上涨家数 | {overview.up_count} |")
+        parts.append(f"| 下跌家数 | {overview.down_count} |")
+        parts.append(f"| 平盘家数 | {overview.flat_count} |")
+        parts.append(f"| 涨停 | {overview.limit_up_count} |")
+        parts.append(f"| 跌停 | {overview.limit_down_count} |")
+        parts.append(f"| 两市成交额 | {overview.total_amount:.0f} 亿 |")
+        parts.append(f"| 北向资金 | {overview.north_flow:+.2f} 亿 |")
+
+        # 板块表现
+        parts.append("")
+        parts.append("### 板块表现")
+        if overview.top_sectors:
+            top_txt = "、".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:5]])
+        else:
+            top_txt = "暂无数据"
+        if overview.bottom_sectors:
+            bottom_txt = "、".join(
+                [f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:5]]
+            )
+        else:
+            bottom_txt = "暂无数据"
+        parts.append(f"- 领涨：{top_txt}")
+        parts.append(f"- 领跌：{bottom_txt}")
+
+        return "\n".join(parts).strip()
         
     def get_market_overview(self) -> MarketOverview:
         """
@@ -676,9 +731,11 @@ class MarketAnalyzer:
         
         # 1. 获取市场概览
         overview = self.get_market_overview()
+        self.last_overview = overview
         
         # 2. 搜索市场新闻
         news = self.search_market_news()
+        self.last_news = news
         
         # 3. 生成复盘报告
         report = self.generate_market_review(overview, news)

@@ -51,11 +51,25 @@ def run_market_review(
         review_report = market_analyzer.run_daily_review()
         
         if review_report:
+            overview = getattr(market_analyzer, "last_overview", None)
+            snapshot_md = ""
+            if overview is not None:
+                try:
+                    snapshot_md = market_analyzer.format_overview_markdown(overview)
+                except Exception as e:
+                    logger.warning(f"生成市场数据快照失败，将仅保存复盘正文: {e}")
+
+            # 拼接“数据快照 + 复盘正文”
+            if snapshot_md:
+                full_report = f"{snapshot_md}\n\n---\n\n{review_report}"
+            else:
+                full_report = review_report
+
             # 保存报告到文件
             date_str = datetime.now().strftime('%Y%m%d')
             report_filename = f"market_review_{date_str}.md"
             filepath = notifier.save_report_to_file(
-                f"# 🎯 大盘复盘\n\n{review_report}", 
+                f"# 🎯 大盘复盘\n\n{full_report}",
                 report_filename
             )
             logger.info(f"大盘复盘报告已保存: {filepath}")
@@ -63,7 +77,7 @@ def run_market_review(
             # 推送通知
             if notifier.is_available():
                 # 添加标题
-                report_content = f"🎯 大盘复盘\n\n{review_report}"
+                report_content = f"🎯 大盘复盘\n\n{full_report}"
                 
                 success = notifier.send(report_content)
                 if success:
