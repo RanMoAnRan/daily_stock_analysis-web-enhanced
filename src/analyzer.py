@@ -13,6 +13,7 @@ A股自选股智能分析系统 - AI分析层
 import json
 import logging
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -578,6 +579,19 @@ class GeminiAnalyzer:
         - 不启用 Google Search（使用外部 Tavily/SerpAPI 搜索）
         """
         try:
+            # 三方依赖在 import 阶段会输出 FutureWarning（不影响运行），但容易被误认为“报错”。
+            # 这里做精确降噪：只屏蔽已知的弃用/版本支持提示，不影响其它告警。
+            warnings.filterwarnings(
+                "ignore",
+                category=FutureWarning,
+                message=r"You are using a Python version .*google\.api_core.*",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                category=FutureWarning,
+                # 该 warning 文本包含换行，使用 [\s\S]* 兼容匹配（等价于 DOTALL）
+                message=r"[\s\S]*All support for the `google\.generativeai` package has ended\.",
+            )
             import google.generativeai as genai
             
             # 配置 API Key
@@ -623,6 +637,16 @@ class GeminiAnalyzer:
             是否成功切换
         """
         try:
+            warnings.filterwarnings(
+                "ignore",
+                category=FutureWarning,
+                message=r"You are using a Python version .*google\.api_core.*",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                category=FutureWarning,
+                message=r"[\s\S]*All support for the `google\.generativeai` package has ended\.",
+            )
             import google.generativeai as genai
             config = get_config()
             fallback_model = config.gemini_model_fallback
