@@ -134,7 +134,13 @@ class MarketAnalyzer:
         
         return overview
 
-    def _call_akshare_with_retry(self, fn, name: str, attempts: int = 2):
+    def _call_akshare_with_retry(
+        self,
+        fn,
+        name: str,
+        attempts: int = 2,
+        final_level: str = "error",
+    ):
         last_error: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
             try:
@@ -144,7 +150,13 @@ class MarketAnalyzer:
                 logger.warning(f"[大盘] {name} 获取失败 (attempt {attempt}/{attempts}): {e}")
                 if attempt < attempts:
                     time.sleep(min(2 ** attempt, 5))
-        logger.error(f"[大盘] {name} 最终失败: {last_error}")
+        # 这里的失败经常是第三方数据源波动/封禁导致；大盘复盘允许部分数据缺失并继续。
+        if final_level == "warning":
+            logger.warning(f"[大盘] {name} 最终失败: {last_error}")
+        elif final_level == "info":
+            logger.info(f"[大盘] {name} 最终失败: {last_error}")
+        else:
+            logger.error(f"[大盘] {name} 最终失败: {last_error}")
         return None
     
     def _get_main_indices(self) -> List[MarketIndex]:
@@ -259,32 +271,90 @@ class MarketAnalyzer:
         """获取市场涨跌统计"""
         try:
             logger.info("[大盘] 获取市场涨跌统计...")
-            
-            # 获取全部A股实时行情
-            df = self._call_akshare_with_retry(ak.stock_zh_a_spot_em, "A股实时行情", attempts=2)
-            
+
+            # === 方案 A：东财(快) ===
+            # 部分网络环境下会被远端直接断开连接；失败后不要抛错，走后续兜底。
+            df = self._call_akshare_with_retry(
+                ak.stock_zh_a_spot_em, "A股实时行情(东财)", attempts=1, final_level="warning"
+            )
+
             if df is not None and not df.empty:
                 # 涨跌统计
-                change_col = '涨跌幅'
+                change_col = "涨跌幅"
                 if change_col in df.columns:
-                    df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
-                    overview.up_count = len(df[df[change_col] > 0])
-                    overview.down_count = len(df[df[change_col] < 0])
-                    overview.flat_count = len(df[df[change_col] == 0])
-                    
-                    # 涨停跌停统计（涨跌幅 >= 9.9% 或 <= -9.9%）
-                    overview.limit_up_count = len(df[df[change_col] >= 9.9])
-                    overview.limit_down_count = len(df[df[change_col] <= -9.9])
-                
+                    df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
+                    overview.up_count = int((df[change_col] > 0).sum())
+                    overview.down_count = int((df[change_col] < 0).sum())
+                    overview.flat_count = int((df[change_col] == 0).sum())
+
+                    # 涨停跌停统计（粗略按 9.9% 阈值）
+                    overview.limit_up_count = int((df[change_col] >= 9.9).sum())
+                    overview.limit_down_count = int((df[change_col] <= -9.9).sum())
+
                 # 两市成交额
-                amount_col = '成交额'
+                amount_col = "成交额"
                 if amount_col in df.columns:
-                    df[amount_col] = pd.to_numeric(df[amount_col], errors='coerce')
-                    overview.total_amount = df[amount_col].sum() / 1e8  # 转为亿元
-                
-                logger.info(f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
-                          f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
-                          f"成交额:{overview.total_amount:.0f}亿")
+                    df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce")
+                    overview.total_amount = float(df[amount_col].sum() / 1e8)  # 转为亿元
+
+                logger.info(
+                    f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
+                    f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
+                    f"成交额:{overview.total_amount:.0f}亿"
+                )
+                return
+
+            # === 方案 C：同花顺行业汇总(轻量兜底) ===
+            # 该接口能提供：各行业上涨/下跌家数、行业成交额；可汇总近似得到全市场统计。
+            ths_df = self._call_akshare_with_retry(
+                ak.stock_board_industry_summary_ths,
+                "行业板块统计(同花顺)",
+                attempts=2,
+                final_level="warning",
+            )
+            if ths_df is not None and not ths_df.empty:
+                up_col, down_col, amount_col = "上涨家数", "下跌家数", "总成交额"
+                if up_col in ths_df.columns and down_col in ths_df.columns:
+                    overview.up_count = int(pd.to_numeric(ths_df[up_col], errors="coerce").fillna(0).sum())
+                    overview.down_count = int(pd.to_numeric(ths_df[down_col], errors="coerce").fillna(0).sum())
+                    overview.flat_count = 0  # 同花顺汇总不含平盘家数，缺省为 0
+                if amount_col in ths_df.columns:
+                    # 同花顺的 “总成交额” 通常单位为 “亿”，这里直接按亿使用
+                    overview.total_amount = float(
+                        pd.to_numeric(ths_df[amount_col], errors="coerce").fillna(0).sum()
+                    )
+                # 涨停/跌停无法从该汇总直接获得，保持为 0
+                overview.limit_up_count = 0
+                overview.limit_down_count = 0
+                logger.info(
+                    f"[大盘] 使用同花顺汇总兜底：涨:{overview.up_count} 跌:{overview.down_count} "
+                    f"成交额:{overview.total_amount:.0f}亿（涨停/跌停/平盘缺失）"
+                )
+                return
+
+            # === 方案 B：新浪(慢，且可能触发封禁；仅作为最后兜底) ===
+            # 注意：该接口需要分页抓取，较慢；只有在同花顺也不可用时才尝试。
+            df = self._call_akshare_with_retry(
+                ak.stock_zh_a_spot, "A股实时行情(新浪)", attempts=1, final_level="warning"
+            )
+            if df is not None and not df.empty:
+                change_col = "涨跌幅"
+                if change_col in df.columns:
+                    df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
+                    overview.up_count = int((df[change_col] > 0).sum())
+                    overview.down_count = int((df[change_col] < 0).sum())
+                    overview.flat_count = int((df[change_col] == 0).sum())
+                    overview.limit_up_count = int((df[change_col] >= 9.9).sum())
+                    overview.limit_down_count = int((df[change_col] <= -9.9).sum())
+                amount_col = "成交额"
+                if amount_col in df.columns:
+                    df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce")
+                    overview.total_amount = float(df[amount_col].sum() / 1e8)
+                logger.info(
+                    f"[大盘] 使用新浪兜底：涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
+                    f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
+                    f"成交额:{overview.total_amount:.0f}亿"
+                )
                 
         except Exception as e:
             logger.error(f"[大盘] 获取涨跌统计失败: {e}")
@@ -293,30 +363,44 @@ class MarketAnalyzer:
         """获取板块涨跌榜"""
         try:
             logger.info("[大盘] 获取板块涨跌榜...")
-            
-            # 获取行业板块行情
-            df = self._call_akshare_with_retry(ak.stock_board_industry_name_em, "行业板块行情", attempts=2)
-            
+
+            # 优先使用同花顺行业板块汇总（更稳定、数据量更小）
+            df = self._call_akshare_with_retry(
+                ak.stock_board_industry_summary_ths,
+                "行业板块行情(同花顺)",
+                attempts=2,
+                final_level="warning",
+            )
+
+            if df is None or df.empty:
+                # 兜底：东财行业板块（部分网络环境可能被断开连接）
+                df = self._call_akshare_with_retry(
+                    ak.stock_board_industry_name_em,
+                    "行业板块行情(东财)",
+                    attempts=1,
+                    final_level="warning",
+                )
+
             if df is not None and not df.empty:
-                change_col = '涨跌幅'
-                if change_col in df.columns:
-                    df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+                # 同花顺字段：板块、涨跌幅；东财字段：板块名称、涨跌幅
+                change_col = "涨跌幅"
+                name_col = "板块" if "板块" in df.columns else "板块名称"
+                if change_col in df.columns and name_col in df.columns:
+                    df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
                     df = df.dropna(subset=[change_col])
-                    
-                    # 涨幅前5
+
                     top = df.nlargest(5, change_col)
                     overview.top_sectors = [
-                        {'name': row['板块名称'], 'change_pct': row[change_col]}
+                        {"name": str(row[name_col]), "change_pct": float(row[change_col])}
                         for _, row in top.iterrows()
                     ]
-                    
-                    # 跌幅前5
+
                     bottom = df.nsmallest(5, change_col)
                     overview.bottom_sectors = [
-                        {'name': row['板块名称'], 'change_pct': row[change_col]}
+                        {"name": str(row[name_col]), "change_pct": float(row[change_col])}
                         for _, row in bottom.iterrows()
                     ]
-                    
+
                     logger.info(f"[大盘] 领涨板块: {[s['name'] for s in overview.top_sectors]}")
                     logger.info(f"[大盘] 领跌板块: {[s['name'] for s in overview.bottom_sectors]}")
                     
@@ -528,7 +612,7 @@ class MarketAnalyzer:
         """使用模板生成复盘报告（无大模型时的备选方案）"""
         
         # 判断市场走势
-        sh_index = next((idx for idx in overview.indices if idx.code == '000001'), None)
+        sh_index = next((idx for idx in overview.indices if idx.code in ('sh000001', '000001')), None)
         if sh_index:
             if sh_index.change_pct > 1:
                 market_mood = "强势上涨"
