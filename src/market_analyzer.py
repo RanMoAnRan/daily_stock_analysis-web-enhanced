@@ -70,6 +70,10 @@ class MarketOverview:
     limit_down_count: int = 0           # 跌停家数
     total_amount: float = 0.0           # 两市成交额（亿元）
     north_flow: float = 0.0             # 北向资金净流入（亿元）
+
+    # 统计数据来源（用于 WebUI/报告展示时解释“为什么是 0/缺失”）
+    stats_source: str = ""              # em/ths/sina/...
+    stats_partial: bool = False         # 是否缺失部分字段（如平盘/涨停/跌停）
     
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
@@ -136,14 +140,17 @@ class MarketAnalyzer:
 
         # 涨跌统计
         parts.append("")
+        def _fmt_int(v: int) -> str:
+            return "-" if v is None or v < 0 else str(int(v))
+
         parts.append("### 涨跌统计")
         parts.append("| 指标 | 数值 |")
         parts.append("|---|---:|")
-        parts.append(f"| 上涨家数 | {overview.up_count} |")
-        parts.append(f"| 下跌家数 | {overview.down_count} |")
-        parts.append(f"| 平盘家数 | {overview.flat_count} |")
-        parts.append(f"| 涨停 | {overview.limit_up_count} |")
-        parts.append(f"| 跌停 | {overview.limit_down_count} |")
+        parts.append(f"| 上涨家数 | {_fmt_int(overview.up_count)} |")
+        parts.append(f"| 下跌家数 | {_fmt_int(overview.down_count)} |")
+        parts.append(f"| 平盘家数 | {_fmt_int(overview.flat_count)} |")
+        parts.append(f"| 涨停 | {_fmt_int(overview.limit_up_count)} |")
+        parts.append(f"| 跌停 | {_fmt_int(overview.limit_down_count)} |")
         parts.append(f"| 两市成交额 | {overview.total_amount:.0f} 亿 |")
         parts.append(f"| 北向资金 | {overview.north_flow:+.2f} 亿 |")
 
@@ -163,7 +170,41 @@ class MarketAnalyzer:
         parts.append(f"- 领涨：{top_txt}")
         parts.append(f"- 领跌：{bottom_txt}")
 
+        if overview.stats_partial:
+            parts.append("")
+            parts.append("> 注：部分统计字段为兜底数据源汇总，可能缺失（显示为 -）。")
+
         return "\n".join(parts).strip()
+
+    def _fill_limit_up_down_counts(self, overview: MarketOverview) -> None:
+        """
+        通过“涨停/跌停股池”补齐涨停/跌停家数（即使涨跌统计走了兜底，也尽量给出该数字）。
+        """
+        try:
+            date = (overview.date or "").replace("-", "").strip()
+            if len(date) != 8:
+                return
+
+            up_df = self._call_akshare_with_retry(
+                lambda: ak.stock_zt_pool_em(date=date),
+                "涨停股池",
+                attempts=1,
+                final_level="warning",
+            )
+            if up_df is not None:
+                overview.limit_up_count = int(len(up_df))
+
+            down_df = self._call_akshare_with_retry(
+                lambda: ak.stock_zt_pool_dtgc_em(date=date),
+                "跌停股池",
+                attempts=1,
+                final_level="warning",
+            )
+            if down_df is not None:
+                overview.limit_down_count = int(len(down_df))
+        except Exception:
+            # 兜底函数：失败就保持原值
+            return
         
     def get_market_overview(self) -> MarketOverview:
         """
@@ -334,6 +375,8 @@ class MarketAnalyzer:
             )
 
             if df is not None and not df.empty:
+                overview.stats_source = "em"
+                overview.stats_partial = False
                 # 涨跌统计
                 change_col = "涨跌幅"
                 if change_col in df.columns:
@@ -357,6 +400,8 @@ class MarketAnalyzer:
                     f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
                     f"成交额:{overview.total_amount:.0f}亿"
                 )
+                # 尽量用涨停/跌停股池覆盖更准确的涨停/跌停家数
+                self._fill_limit_up_down_counts(overview)
                 return
 
             # === 方案 C：同花顺行业汇总(轻量兜底) ===
@@ -368,19 +413,23 @@ class MarketAnalyzer:
                 final_level="warning",
             )
             if ths_df is not None and not ths_df.empty:
+                overview.stats_source = "ths"
+                overview.stats_partial = True
                 up_col, down_col, amount_col = "上涨家数", "下跌家数", "总成交额"
                 if up_col in ths_df.columns and down_col in ths_df.columns:
                     overview.up_count = int(pd.to_numeric(ths_df[up_col], errors="coerce").fillna(0).sum())
                     overview.down_count = int(pd.to_numeric(ths_df[down_col], errors="coerce").fillna(0).sum())
-                    overview.flat_count = 0  # 同花顺汇总不含平盘家数，缺省为 0
+                    # 同花顺汇总不含平盘家数：用 -1 表示“缺失”
+                    overview.flat_count = -1
                 if amount_col in ths_df.columns:
                     # 同花顺的 “总成交额” 通常单位为 “亿”，这里直接按亿使用
                     overview.total_amount = float(
                         pd.to_numeric(ths_df[amount_col], errors="coerce").fillna(0).sum()
                     )
-                # 涨停/跌停无法从该汇总直接获得，保持为 0
-                overview.limit_up_count = 0
-                overview.limit_down_count = 0
+                # 涨停/跌停优先走股池补齐
+                overview.limit_up_count = -1
+                overview.limit_down_count = -1
+                self._fill_limit_up_down_counts(overview)
                 logger.info(
                     f"[大盘] 使用同花顺汇总兜底：涨:{overview.up_count} 跌:{overview.down_count} "
                     f"成交额:{overview.total_amount:.0f}亿（涨停/跌停/平盘缺失）"
@@ -393,6 +442,8 @@ class MarketAnalyzer:
                 ak.stock_zh_a_spot, "A股实时行情(新浪)", attempts=1, final_level="warning"
             )
             if df is not None and not df.empty:
+                overview.stats_source = "sina"
+                overview.stats_partial = False
                 change_col = "涨跌幅"
                 if change_col in df.columns:
                     df[change_col] = pd.to_numeric(df[change_col], errors="coerce")
@@ -410,6 +461,7 @@ class MarketAnalyzer:
                     f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
                     f"成交额:{overview.total_amount:.0f}亿"
                 )
+                self._fill_limit_up_down_counts(overview)
                 
         except Exception as e:
             logger.error(f"[大盘] 获取涨跌统计失败: {e}")
@@ -600,6 +652,9 @@ class MarketAnalyzer:
                 snippet = n.get('snippet', '')[:100]
             news_text += f"{i}. {title}\n   {snippet}\n"
         
+        def _fmt_int(v: int) -> str:
+            return "暂无" if v is None or v < 0 else str(int(v))
+
         prompt = f"""你是一位专业的A股市场分析师，请根据以下数据生成一份简洁的大盘复盘报告。
 
 【重要】输出要求：
@@ -619,8 +674,8 @@ class MarketAnalyzer:
 {indices_text if indices_text else "暂无指数数据（接口异常）"}
 
 ## 市场概况
-- 上涨: {overview.up_count} 家 | 下跌: {overview.down_count} 家 | 平盘: {overview.flat_count} 家
-- 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
+- 上涨: {_fmt_int(overview.up_count)} 家 | 下跌: {_fmt_int(overview.down_count)} 家 | 平盘: {_fmt_int(overview.flat_count)} 家
+- 涨停: {_fmt_int(overview.limit_up_count)} 家 | 跌停: {_fmt_int(overview.limit_down_count)} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元
 - 北向资金: {overview.north_flow:+.2f} 亿元
 

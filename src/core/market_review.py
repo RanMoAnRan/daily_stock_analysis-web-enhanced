@@ -85,7 +85,8 @@ def run_market_review(
                 else:
                     logger.warning("大盘复盘推送失败")
             
-            return review_report
+            # 返回完整 Markdown（含数据快照），便于 WebUI 展示与上层复用
+            return full_report
         
     except Exception as e:
         logger.error(f"大盘复盘分析失败: {e}")
